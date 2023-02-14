@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"sort"
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -64,20 +65,23 @@ type Raft struct {
 	// 服务器已知最新的任期（在服务器首次启动时初始化为0，单调递增）
 	currentTerm int
 	// 当前任期内收到选票的 candidateId，如果没有投给任何候选人 则为空
+	// 即使节点重启，Raft 算法也能保证每个任期最多只有一个 leader。
 	votedFor int
-	// 日志条目；每个条目包含了用于状态机的命令，以及领导人接收到该条目时的任期（初始索引为1）
+	// 已经 committed 的日志，保证状态机可恢复。
 	logs []Entry
 
 	// 所有服务器上的易失性状态
 	// 已知已提交的最高的日志条目的索引（初始值为0，单调递增）
+	//leader 节点重启后可以通过 appendEntries rpc 逐渐得到不同节点的 matchIndex，从而确认 commitIndex
+	//follower 只需等待 leader 传递过来的 commitIndex 即可
 	commitIndex int
 	// 已经被应用到状态机的最高的日志条目的索引（初始值为0，单调递增）
 	lastApplied int
 
-	// 领导人（服务器）上的易失性状态 (选举后已经重新初始化)
-	// 对于每一台服务器，发送到该服务器的下一个日志条目的索引（初始值为领导人最后的日志条目的索引+1）
+	// 领导人（服务器）上的易失性状态 每次选举后，leader 的此两个数组都应该立刻重新初始化并开始探测
+	// 为每一个 follower 保存的，应该发送的下一份 entry index（初始值为领导人最后的日志条目的索引 +1  , last index + 1。）
 	nextIndex []int
-	// 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始值为0，单调递增）
+	// 已确认的，已经同步到每一个 follower 的 entry index（初始值为0，根据复制状态不断递增，）
 	matchIndex []int
 
 	state   State
@@ -190,7 +194,7 @@ func (rf *Raft) genRequestVoteArgs() *RequestVoteArgs {
 func (rf *Raft) startElection() {
 	args := rf.genRequestVoteArgs()
 	DPrintf("[Node %v] starts election with RequestVoteArgs: %v", rf.me, args)
-	//先给自己投一票 ???
+	//先给自己投一票
 	rf.votedFor = rf.me
 	rf.persist()
 	grantedVotes := 1
@@ -268,7 +272,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
-	//
+	// Raft 在投票阶段就确保选举出的 leader 一定包含了整个集群中目前已 committed 的所有日志。
+	// 判断日志新旧的方式：获取请求的 entry 后，比对自己日志中的最后一个 entry。
+	//首先比对 term，如果自己的 term 更大，则拒绝请求。
+	//如果 term 一样，则比对 index，如果自己的 index 更大（说明自己的日志更长），则拒绝请求
 	if args.LastLogTerm < rf.getLastLog().Term || (args.LastLogTerm == rf.getLastLog().Term && args.LastLogIndex < rf.getLastLog().Index) {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
@@ -297,31 +304,190 @@ func (rf *Raft) broadcastHeartbeat(isHeartbeat bool) {
 		if peer == rf.me {
 			continue
 		}
-		//if isHeartbeat {
-		//	go rf.do
-		//} else {
-		//	rf
-		//}
+		if isHeartbeat {
+			go rf.doReplicate(peer)
+		} else {
+			rf.replicatorCond[peer].Signal()
+		}
 	}
 }
 
-//func (rf *Raft) genAppendEntriesArgs(prevLogIndex int) *AppendEntriesArgs {
-//	firstIndex := rf.getFirstLog().Index
-//	entries := make([]Entry, len(rf.logs[prevLogIndex+1-firstIndex:]))
-//	copy(entries, rf.logs[prevLogIndex+1-firstIndex:])
-//	return &AppendEntriesArgs{
-//		Term:         rf.currentTerm,
-//		LeaderId:     rf.me,
-//		PreLogIndex:  prevLogIndex,
-//		PreLogTerm:   rf.logs[prevLogIndex-firstIndex].Term,
-//		Entries:      entries,
-//		LeaderCommit: rf.commitIndex,
-//	}
-//}
+// 寻找共识点时，leader 还是通过 AppendEntriesRPC 和 follower 进行一致性检查，
+// 方法是发送再上一块的 entry， 如果 follower 依然拒绝，则 leader 再尝试发送更前面的一块，直到找到双方的共识点。
+func (rf *Raft) doReplicate(peer int) {
+	rf.mu.RLock()
+	if rf.state != Leader {
+		rf.mu.RUnlock()
+		return
+	}
+	// 对于一个新当选的leader，rf.nextIndex[peer]初始化为rf.getLastLog().Index + 1
+	// 此时preLogIndex就是leader最后一条log的index
+	preLogIndex := rf.nextIndex[peer] - 1
+	if preLogIndex >= rf.getFirstLog().Index {
+		args := rf.genAppendEntriesArgs(preLogIndex)
+		rf.mu.RUnlock()
+		reply := new(AppendEntriesReply)
+		if rf.sendAppendEntries(peer, args, reply) {
+			rf.mu.Lock()
+			rf.handleAppendEntriesReply(peer, args, reply)
+			rf.mu.Unlock()
+		}
+	} else { // need snapshot
+		//args := rf.genInstallSnapshotArgs()
+		//rf.mu.RUnlock()
+		//reply := new(InstallSnapshotReply)
+		//if rf.sendInstallSnapshot(peer, args, reply) {
+		//	rf.mu.Lock()
+		//	rf.handleInstallSnapshotReply(peer, args, reply)
+		//	rf.mu.Unlock()
+		//}
+	}
+}
+func (rf *Raft) genAppendEntriesArgs(prevLogIndex int) *AppendEntriesArgs {
+	firstIndex := rf.getFirstLog().Index
+	entries := make([]Entry, len(rf.logs[prevLogIndex+1-firstIndex:]))
+	// 深拷贝，snapshot时可能会把entry删掉，导致发送的RPC里entries引用不到
+	copy(entries, rf.logs[prevLogIndex+1-firstIndex:])
+	return &AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  rf.logs[prevLogIndex-firstIndex].Term,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+}
 
-//func (rf *Raft) AppendEntries(args *App) {
-//
-//}
+// used by AppendEntries Handler to judge whether log is matched
+func (rf *Raft) matchLog(term, index int) bool {
+	//	prevLogIndex > rf.getLastLog().Index说明当前节点缺少日志
+	//	rf.logs[prevLogIndex - rf.getFirstLog().Index].Term != term说明存在日志冲突 ???
+	return index <= rf.getLastLog().Index && rf.logs[index-rf.getFirstLog().Index].Term == term
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer DPrintf("[Node %v]'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} "+
+		"before processing AppendEntriesArgs %v and reply AppendEntriesReply %v",
+		rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), args, reply)
+	// 返回假 如果领导人的任期小于接收者的当前任期 这里的接收者是指跟随者或者候选人
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
+	rf.changeState(Follower)
+	//	 没重置
+	if args.PrevLogIndex < rf.getFirstLog().Index {
+		reply.Term = 0
+		reply.Success = false
+		DPrintf("[Node %v] receives unexpected AppendEntriesRequest %v from [Node %v] because prevLogIndex %v < firstLogIndex %v", rf.me, args, args.LeaderId, args.PrevLogIndex, rf.getFirstLog().Index)
+		return
+	}
+	// 在接收者日志中 如果能找到一个和 prevLogIndex 以及 prevLogTerm 一样的索引和任期的日志条目 则继续执行下面的步骤 否则返回假
+	if !rf.matchLog(args.PrevLogTerm, args.PrevLogIndex) {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		lastIndex := rf.getLastLog().Index
+		// 当前Follower日志太短，以至于在冲突的位置没有Log条目，Leader应该回退到Follower最后一条Log条目的下一条
+		if lastIndex < args.PrevLogIndex {
+			reply.ConflictTerm = -1
+			reply.ConflictIndex = lastIndex + 1
+		} else {
+			firstIndex := rf.getFirstLog().Index
+			reply.ConflictTerm = rf.logs[args.PrevLogIndex-firstIndex].Term
+			index := args.PrevLogIndex - 1
+			for index >= firstIndex && rf.logs[index-firstIndex].Term == reply.ConflictTerm {
+				index -= 1
+			}
+			reply.ConflictIndex = index
+		}
+		return
+	}
+	firstIndex := rf.getFirstLog().Index
+	for index, entry := range args.Entries {
+		if entry.Index-firstIndex >= len(rf.logs) || rf.logs[entry.Index-firstIndex].Term != entry.Term {
+			rf.logs = append(rf.logs[:entry.Index-firstIndex], args.Entries[index:]...)
+			break
+		}
+	}
+	rf.followerCommit(args.LeaderCommit)
+	reply.Term = rf.currentTerm
+	reply.Success = true
+}
+
+func (rf *Raft) handleAppendEntriesReply(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// 确保当前仍是Leader状态并且Term没有改变的情况下才处理reply RPC
+	if rf.state == Leader && rf.currentTerm == args.Term {
+		if reply.Success {
+			rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
+			rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+			rf.leaderCommit()
+		} else {
+			if reply.Term > rf.currentTerm {
+				rf.changeState(Follower)
+				rf.currentTerm = reply.Term
+				rf.votedFor = -1
+				rf.persist()
+				return
+			} else if reply.Term == rf.currentTerm {
+				// ?
+				rf.nextIndex[peer] = reply.ConflictIndex
+				if reply.ConflictTerm == -1 { // follower最后一条日志比preLogIndex还小
+					firstIndex := rf.getFirstLog().Index
+					for i := args.PrevLogIndex; i >= firstIndex; i-- {
+						if rf.logs[i-firstIndex].Term == reply.ConflictTerm {
+							rf.nextIndex[peer] = i + 1
+							break
+						}
+					}
+				}
+			}
+
+		}
+	}
+	DPrintf("[Node %v]'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} "+
+		"after handling AppendEntriesReply %v from [Node %v] for AppendEntriesArgs %v",
+		rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), reply, peer, args)
+}
+
+// append entries rpc
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) followerCommit(leaderCommit int) {
+	if leaderCommit > rf.commitIndex {
+		rf.commitIndex = Min(leaderCommit, rf.getLastLog().Index)
+		rf.applyCond.Signal()
+	}
+}
+func (rf *Raft) leaderCommit() {
+	//根据matchIndex，判断出那些log已经被大多数peer记录了
+	n := len(rf.matchIndex)
+	tmp := make([]int, n)
+	copy(tmp, rf.matchIndex)
+	sort.Sort(sort.Reverse(sort.IntSlice(tmp)))
+	newCommitIndex := tmp[n/2]
+	if newCommitIndex > rf.commitIndex {
+		// leader只能提交当前任期下的日志
+		if newCommitIndex <= rf.getLastLog().Index && rf.currentTerm == rf.logs[newCommitIndex-rf.getFirstLog().Index].Term {
+			DPrintf("[Node %d] advance commitIndex from %d to %d with matchIndex %v in term %d",
+				rf.me, rf.commitIndex, newCommitIndex, rf.matchIndex, rf.currentTerm)
+			rf.commitIndex = newCommitIndex
+			rf.applyCond.Signal()
+		} else {
+			DPrintf("[Node %d] can not advance commitIndex from %d because the term of newCommitIndex %d is not equal to currentTerm %d",
+				rf.me, rf.commitIndex, newCommitIndex, rf.currentTerm)
+		}
+	}
+}
 
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
