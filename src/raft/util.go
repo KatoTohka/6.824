@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
 	"sync"
 	"time"
 )
@@ -71,11 +72,23 @@ func FixedHeartBeatTimeout() time.Duration {
 }
 
 // Debugging
-const Debug = false
+const Debug = true
 
+var loger *log.Logger
+
+func init() {
+	file := "./" + time.Now().Format("20060102") + ".txt"
+	logFile, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0766)
+	if err != nil {
+		panic(err)
+	}
+	loger = log.New(logFile, "[qSkiptool]", log.LstdFlags|log.Lshortfile|log.LUTC) // 将文件设置为loger作为输出
+	return
+}
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
-		log.Printf(format, a...)
+		//log.Printf(format, a...)
+		loger.Printf(format, a...)
 	}
 	return
 }

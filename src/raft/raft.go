@@ -69,6 +69,7 @@ type Raft struct {
 	// 当前任期内收到选票的 candidateId，如果没有投给任何候选人 则为空
 	// 即使节点重启，Raft 算法也能保证每个任期最多只有一个 leader。
 	votedFor int
+	voteCnt  int
 	// 已经 committed 的日志，保证状态机可恢复。
 	logs []Entry
 
@@ -301,7 +302,7 @@ func (rf *Raft) startElection() {
 	//先给自己投一票
 	rf.votedFor = rf.me
 	rf.persist()
-	grantedVotes := 1
+	rf.voteCnt = 1
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
@@ -313,31 +314,40 @@ func (rf *Raft) startElection() {
 			if rf.sendRequestVote(peer, args, reply) {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				DPrintf("[Node %v] receives RequestVoteReply %v from [Node %v] after sending RequestVoteArgs %v in term %v", rf.me, args, peer, reply, rf.currentTerm)
-				//	一旦这个节点不在是candidate或者term增加了，后续传过来的投票就过期，丢弃
-				// rf我们无法控制，只能通过加锁的方式控制在当前函数运行时不变，但是在此之前可能已经发生了变化
-				// args代表rf(先前)任期的情况，reply和args是相同的term
-				if rf.state == Candidate && rf.currentTerm == args.Term {
-					if reply.VoteGranted {
-						// 注意这里是由于在外面是异步的，一旦超过半数就立即作为leader
-						grantedVotes += 1
-						if grantedVotes > len(rf.peers)/2 {
-							DPrintf("[Node %v] receives majority votes in term %v", rf.me, rf.currentTerm)
-							rf.changeState(Leader)
-							// 当选leader后立即发送心跳信号
-							rf.broadcastHeartbeat(true)
-						}
-					} else if reply.Term > rf.currentTerm {
-						DPrintf("[Node %v] finds a new leader [Node %v] with term %v and steps down in term %v", rf.me, peer, reply.Term, rf.currentTerm)
-						rf.changeState(Follower)
-						// rf改变状态，开启下一轮
-						rf.currentTerm = reply.Term
-						rf.votedFor = -1
-						rf.persist()
-					}
-				}
+				rf.handleRequestVoteReply(peer, args, reply)
 			}
 		}(peer)
+	}
+}
+
+// 候选者处理投票者的reply
+func (rf *Raft) handleRequestVoteReply(peer int, args *RequestVoteArgs, reply *RequestVoteReply) {
+	DPrintf("[Node %v] receives RequestVoteReply %v from [Node %v] after sending RequestVoteArgs %v in term %v", rf.me, args, peer, reply, rf.currentTerm)
+	//	一旦这个节点不在是candidate或者term增加了，后续传过来的投票就过期，丢弃
+	// rf我们无法控制，只能通过加锁的方式控制在当前函数运行时不变，但是在此之前可能已经发生了变化
+	// args代表rf(先前)任期的情况，reply和args是相同的term
+	if rf.state == Candidate && rf.currentTerm == args.Term {
+		if reply.Term > rf.currentTerm {
+			DPrintf("[Node %v] finds a new leader [Node %v] with term %v and steps down in term %v", rf.me, peer, reply.Term, rf.currentTerm)
+			rf.changeState(Follower)
+			// rf改变状态，开启下一轮
+			rf.currentTerm = reply.Term
+			rf.votedFor = -1
+			rf.voteCnt = 0
+			rf.persist()
+			return
+		}
+		if reply.VoteGranted {
+			// 注意这里是由于在外面是异步的，一旦超过半数就立即作为leader
+			rf.voteCnt += 1
+			if rf.voteCnt > len(rf.peers)/2 {
+				DPrintf("[Node %v] receives majority votes in term %v", rf.me, rf.currentTerm)
+				rf.changeState(Leader)
+				rf.voteCnt = 0
+				// 当选leader后立即发送心跳信号
+				rf.broadcastHeartbeat(true)
+			}
+		}
 	}
 }
 
@@ -349,6 +359,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
+	// defer print，如果参数是值，如rf.state,调用这条语句那一刻就固定了，不会改变
+	// 如果参数是指针，如reply, 值会变化
 	defer DPrintf("[Node %v]'s state is {state %v,term %v} before processing requestVoteRequest %v and reply requestVoteResponse %v",
 		rf.me, rf.state, rf.currentTerm, args, reply)
 	//	过期请求
@@ -476,6 +488,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// 更新自己状态为Follower
 	rf.changeState(Follower)
+	//????
+	rf.electionTimer.Reset(RandomElectionTimeOut())
 	//	 leader的PrevLogIndex比自己的第一条log的index还小？？
 	if args.PrevLogIndex < rf.getFirstLog().Index {
 		reply.Term = 0
@@ -532,6 +546,8 @@ func (rf *Raft) handleAppendEntriesReply(peer int, args *AppendEntriesArgs, repl
 		// 不是leader了
 		if reply.Term > rf.currentTerm {
 			rf.changeState(Follower)
+			//>>>
+			//rf.electionTimer.Reset(RandomElectionTimeOut())
 			rf.currentTerm = reply.Term
 			rf.votedFor = -1
 			rf.persist()
@@ -736,15 +752,6 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		select {
-		case <-rf.electionTimer.C:
-			rf.mu.Lock()
-			DPrintf("[Node %d] election elapsed, start election", rf.me)
-			rf.changeState(Candidate)
-			rf.currentTerm += 1
-			rf.startElection()
-			//	startElection异步发起投票后返回，重置选举超时时间
-			rf.electionTimer.Reset(RandomElectionTimeOut())
-			rf.mu.Unlock()
 		case <-rf.heartbeatTimer.C:
 			rf.mu.Lock()
 			// 只有leader才会心跳
@@ -754,7 +761,15 @@ func (rf *Raft) ticker() {
 				rf.heartbeatTimer.Reset(FixedHeartBeatTimeout())
 			}
 			rf.mu.Unlock()
-
+		case <-rf.electionTimer.C:
+			rf.mu.Lock()
+			DPrintf("[Node %d] election elapsed, start election", rf.me)
+			rf.changeState(Candidate)
+			rf.currentTerm += 1
+			rf.startElection()
+			//	startElection异步发起投票后返回，重置选举超时时间
+			rf.electionTimer.Reset(RandomElectionTimeOut())
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -796,9 +811,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		currentTerm: 0,
 		logs:        make([]Entry, 1),
 		votedFor:    -1,
-
-		nextIndex:  make([]int, len(peers)),
-		matchIndex: make([]int, len(peers)),
+		voteCnt:     0,
+		nextIndex:   make([]int, len(peers)),
+		matchIndex:  make([]int, len(peers)),
 
 		state:          Follower,
 		applyCh:        applyCh,
