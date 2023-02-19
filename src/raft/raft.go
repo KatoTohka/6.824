@@ -320,11 +320,11 @@ func (rf *Raft) doReplicate(peer int) {
 		rf.mu.RUnlock()
 		return
 	}
-	// 对于一个新当选的leader，rf.nextIndex[peer]初始化为rf.getLastLog().Index + 1
-	// 此时preLogIndex就是leader最后一条log的index
-	preLogIndex := rf.nextIndex[peer] - 1
-	if preLogIndex >= rf.getFirstLog().Index {
-		args := rf.genAppendEntriesArgs(preLogIndex)
+	// 注意：对于一个新当选的leader，rf.nextIndex[peer]初始化为rf.getLastLog().Index + 1
+	// 此时prevLogIndex就是leader最后一条log的index
+	prevLogIndex := rf.nextIndex[peer] - 1
+	if prevLogIndex >= rf.getFirstLog().Index {
+		args := rf.genAppendEntriesArgs(prevLogIndex)
 		rf.mu.RUnlock()
 		reply := new(AppendEntriesReply)
 		if rf.sendAppendEntries(peer, args, reply) {
@@ -358,16 +358,11 @@ func (rf *Raft) genAppendEntriesArgs(prevLogIndex int) *AppendEntriesArgs {
 	}
 }
 
-// used by AppendEntries Handler to judge whether log is matched
-func (rf *Raft) matchLog(term, index int) bool {
-	//	prevLogIndex > rf.getLastLog().Index说明当前节点缺少日志
-	//	rf.logs[prevLogIndex - rf.getFirstLog().Index].Term != term说明存在日志冲突 ???
-	return index <= rf.getLastLog().Index && rf.logs[index-rf.getFirstLog().Index].Term == term
-}
-
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
+
 	defer DPrintf("[Node %v]'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} "+
 		"before processing AppendEntriesArgs %v and reply AppendEntriesReply %v",
 		rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), args, reply)
@@ -377,12 +372,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
+	// 更新自己的任期
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
+	// 更新自己状态为Follower
 	rf.changeState(Follower)
-	//	 没重置
+	//	 leader的PrevLogIndex比自己的第一条log的index还小？？
 	if args.PrevLogIndex < rf.getFirstLog().Index {
 		reply.Term = 0
 		reply.Success = false
@@ -390,30 +387,41 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	// 在接收者日志中 如果能找到一个和 prevLogIndex 以及 prevLogTerm 一样的索引和任期的日志条目 则继续执行下面的步骤 否则返回假
-	if !rf.matchLog(args.PrevLogTerm, args.PrevLogIndex) {
-		reply.Term = rf.currentTerm
+	lastLogIndex := rf.getLastLog().Index
+	firstLogIndex := rf.getFirstLog().Index
+	//prevLogIndex > rf.getLastLog().Index : 当前follower存在log缺失
+	//rf.logs[preLogIndex - firstLogIndex].Term != Term Term不匹配，存在日志冲突
+	if args.PrevLogIndex > lastLogIndex ||
+		rf.logs[args.PrevLogIndex-firstLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
-		lastIndex := rf.getLastLog().Index
+		reply.Term = rf.currentTerm
 		// 当前Follower日志太短，以至于在冲突的位置没有Log条目，Leader应该回退到Follower最后一条Log条目的下一条
-		if lastIndex < args.PrevLogIndex {
-			reply.ConflictTerm = -1
-			reply.ConflictIndex = lastIndex + 1
-		} else {
-			firstIndex := rf.getFirstLog().Index
-			reply.ConflictTerm = rf.logs[args.PrevLogIndex-firstIndex].Term
-			index := args.PrevLogIndex - 1
-			for index >= firstIndex && rf.logs[index-firstIndex].Term == reply.ConflictTerm {
-				index -= 1
+		if args.PrevLogIndex > lastLogIndex {
+			//follower在对应位置没有Log，那么这里会返回 -1
+			reply.XTerm = -1
+			reply.XLen = args.PrevLogIndex - rf.getLastLog().Index
+		} else { //follower的日志存在冲突
+			//将自己的任期号放在XTerm中
+			reply.XTerm = rf.logs[args.PrevLogIndex-firstLogIndex].Term
+			i := 0
+			//找到对应任期号为XTerm的第一条Log条目的槽位号
+			for i = args.PrevLogIndex; i > firstLogIndex; i-- {
+				if rf.logs[i-firstLogIndex].Term != reply.XTerm {
+					break
+				}
 			}
-			reply.ConflictIndex = index
+			reply.XIndex = i + 1
 		}
 		return
 	}
-	firstIndex := rf.getFirstLog().Index
-	for index, entry := range args.Entries {
-		if entry.Index-firstIndex >= len(rf.logs) || rf.logs[entry.Index-firstIndex].Term != entry.Term {
-			rf.logs = append(rf.logs[:entry.Index-firstIndex], args.Entries[index:]...)
-			break
+	// 没有发生丢失或冲突
+	for i, entry := range args.Entries {
+		//找到Index不合
+		if entry.Index > lastLogIndex ||
+			// term不合的地方
+			rf.logs[entry.Index-firstLogIndex].Term != entry.Term {
+			//直接覆盖后面的entry
+			rf.logs = append(rf.logs[:entry.Index-firstLogIndex], args.Entries[i:]...)
 		}
 	}
 	rf.followerCommit(args.LeaderCommit)
@@ -424,31 +432,38 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) handleAppendEntriesReply(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// 确保当前仍是Leader状态并且Term没有改变的情况下才处理reply RPC
 	if rf.state == Leader && rf.currentTerm == args.Term {
+		// 不是leader了
+		if reply.Term > rf.currentTerm {
+			rf.changeState(Follower)
+			rf.currentTerm = reply.Term
+			rf.votedFor = -1
+			rf.persist()
+			return
+		}
 		if reply.Success {
 			rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
 			rf.nextIndex[peer] = rf.matchIndex[peer] + 1
 			rf.leaderCommit()
 		} else {
-			if reply.Term > rf.currentTerm {
-				rf.changeState(Follower)
-				rf.currentTerm = reply.Term
-				rf.votedFor = -1
-				rf.persist()
-				return
-			} else if reply.Term == rf.currentTerm {
-				// ?
-				rf.nextIndex[peer] = reply.ConflictIndex
-				if reply.ConflictTerm == -1 { // follower最后一条日志比preLogIndex还小
-					firstIndex := rf.getFirstLog().Index
-					for i := args.PrevLogIndex; i >= firstIndex; i-- {
-						if rf.logs[i-firstIndex].Term == reply.ConflictTerm {
-							rf.nextIndex[peer] = i + 1
-							break
-						}
+			// case 3: 缺少日志
+			if reply.XTerm == -1 {
+				rf.nextIndex[peer] -= reply.XLen
+			} else {
+				firstLogIndex := rf.getFirstLog().Index
+				find := false
+				for i := args.PrevLogIndex; i >= firstLogIndex; i-- {
+					// case 2: Leader发现自己有任期的日志，它会将自己本地记录的nextIndex设置到本地在XTerm位置的Log条目后面
+					if rf.logs[i-firstLogIndex].Term == reply.XIndex {
+						find = true
+						rf.nextIndex[peer] = reply.XIndex + 1
+						break
 					}
 				}
+				// case1 : Leader完全没有XTerm的任何Log，那么它应该回退到XIndex对应的位置
+				if !find {
+					rf.nextIndex[peer] = reply.XIndex
+				}
 			}
-
 		}
 	}
 	DPrintf("[Node %v]'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} "+
@@ -469,11 +484,13 @@ func (rf *Raft) followerCommit(leaderCommit int) {
 	}
 }
 func (rf *Raft) leaderCommit() {
-	//根据matchIndex，判断出那些log已经被大多数peer记录了
+	//注意：是根据matchIndex，判断出那些log已经被大多数peer记录了
 	n := len(rf.matchIndex)
 	tmp := make([]int, n)
 	copy(tmp, rf.matchIndex)
+	//降序排序
 	sort.Sort(sort.Reverse(sort.IntSlice(tmp)))
+	//找到新的commitIndex
 	newCommitIndex := tmp[n/2]
 	if newCommitIndex > rf.commitIndex {
 		// leader只能提交当前任期下的日志
@@ -487,6 +504,14 @@ func (rf *Raft) leaderCommit() {
 				rf.me, rf.commitIndex, newCommitIndex, rf.currentTerm)
 		}
 	}
+}
+
+func (rf *Raft) getFirstLog() Entry {
+	return rf.logs[0]
+}
+
+func (rf *Raft) getLastLog() Entry {
+	return rf.logs[len(rf.logs)-1]
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -521,14 +546,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) getFirstLog() Entry {
-	return rf.logs[0]
-}
-
-func (rf *Raft) getLastLog() Entry {
-	return rf.logs[len(rf.logs)-1]
-}
-
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -542,13 +559,27 @@ func (rf *Raft) getLastLog() Entry {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
-
-	return index, term, isLeader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state == Leader {
+		lastLog := rf.getLastLog()
+		newLog := Entry{
+			// 无语，漏了个+1，卡了半天
+			Index:   lastLog.Index + 1,
+			Term:    rf.currentTerm,
+			Command: command,
+		}
+		rf.logs = append(rf.logs, newLog)
+		//先改自己的
+		rf.matchIndex[rf.me] = newLog.Index
+		rf.nextIndex[rf.me] = newLog.Index + 1
+		rf.persist()
+		DPrintf("[Node %v] receives a new command[%v] to replicate in term %v", rf.me, newLog, rf.currentTerm)
+		rf.broadcastHeartbeat(false)
+		return newLog.Index, newLog.Term, true
+	}
+	return -1, -1, false
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -568,6 +599,32 @@ func (rf *Raft) Kill() {
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
+}
+
+func (rf *Raft) applier() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		for rf.lastApplied >= rf.commitIndex {
+			rf.applyCond.Wait()
+		}
+		lastApplied := rf.lastApplied
+		firstLogIndex := rf.getFirstLog().Index
+		commitIndex := rf.commitIndex
+		applyEntries := make([]Entry, commitIndex-lastApplied)
+		copy(applyEntries, rf.logs[lastApplied-firstLogIndex+1:commitIndex-firstLogIndex+1])
+		rf.mu.Unlock()
+		for _, entry := range applyEntries {
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: entry.Index,
+			}
+			rf.applyCh <- applyMsg
+		}
+		rf.mu.Lock()
+		rf.lastApplied = Max(rf.lastApplied, commitIndex)
+		rf.mu.Unlock()
+	}
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -605,6 +662,23 @@ func (rf *Raft) ticker() {
 	}
 }
 
+func (rf *Raft) replicator(peer int) {
+	rf.replicatorCond[peer].L.Lock()
+	defer rf.replicatorCond[peer].L.Unlock()
+	for !rf.killed() {
+		for !rf.needReplicating(peer) {
+			rf.replicatorCond[peer].Wait()
+		}
+		rf.doReplicate(peer)
+	}
+}
+
+func (rf *Raft) needReplicating(peer int) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.state == Leader && rf.matchIndex[peer] < rf.getLastLog().Index
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -635,9 +709,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		electionTimer:  time.NewTimer(RandomElectionTimeOut()),
 		heartbeatTimer: time.NewTimer(FixedHeartBeatTimeout()),
 	}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
 
@@ -652,7 +723,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			rf.replicatorCond[i] = sync.NewCond(&sync.Mutex{})
 			// 启动复制器 goroutine 以批量复制条目
 			// 分别管理对应 peer 的复制状态
-			//go rf.repl
+			go rf.replicator(i)
 		}
 	}
 
@@ -660,6 +731,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 用来触发 heartbeat timeout 和 election timeout
 	go rf.ticker()
 	// 用来往 applyCh 中 push 提交的日志并保证 exactly once
-	//go rf.app
+	go rf.applier()
 	return rf
 }

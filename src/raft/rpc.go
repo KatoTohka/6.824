@@ -60,11 +60,13 @@ type AppendEntriesReply struct {
 	// 当前任期，对于领导人而言 它会更新自己的任期
 	Term int
 	// 如果跟随者所含有的条目和 prevLogIndex 以及 prevLogTerm 匹配上了，则为 true
-	Success       bool
-	ConflictIndex int
-	ConflictTerm  int
+	Success bool
+	//	快速恢复
+	XTerm  int
+	XIndex int
+	XLen   int
 }
 
 func (response AppendEntriesReply) String() string {
-	return fmt.Sprintf("{Term:%v,Success:%v,ConflictIndex:%v,ConflictTerm:%v}", response.Term, response.Success, response.ConflictIndex, response.ConflictTerm)
+	return fmt.Sprintf("{Term:%v,Success:%v,XTerm:%v,XIndex:%v,XLen:%v}", response.Term, response.Success, response.XTerm, response.XIndex, response.XLen)
 }
