@@ -138,19 +138,22 @@ func (rf *Raft) changeState(state State) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
+	rf.persister.SaveRaftState(rf.encodeState())
+}
+
+func (rf *Raft) encodeState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.logs)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	return data
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
-
 		return
 	}
 	// Your code here (2C).
@@ -168,6 +171,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.logs = logs
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
+		//rf.logs 中始终至少有一个条目
 		rf.lastApplied = rf.logs[0].Index
 		rf.commitIndex = rf.logs[0].Index
 	}
@@ -177,9 +181,26 @@ func (rf *Raft) readPersist(data []byte) {
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
 	// Your code here (2D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if lastIncludedIndex <= rf.commitIndex {
+		return false
+	}
+	if lastIncludedIndex > rf.getLastLog().Index {
+		rf.logs = make([]Entry, 1)
+	} else {
+		tmp := make([]Entry, len(rf.logs[lastIncludedIndex-rf.getFirstLog().Index:]))
+		copy(tmp, rf.logs[lastIncludedIndex-rf.getFirstLog().Index:])
+		rf.logs = tmp
+		rf.logs[0].Command = nil
+	}
+	rf.logs[0].Term = lastIncludedTerm
+	rf.logs[0].Index = lastIncludedIndex
+	rf.lastApplied = lastIncludedIndex
+	rf.commitIndex = lastIncludedIndex
+	rf.persister.SaveStateAndSnapshot(rf.encodeState(), snapshot)
+	DPrintf("[Node %v]'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} after accepting the snapshot which lastIncludedTerm is %v, lastIncludedIndex is %v", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), lastIncludedTerm, lastIncludedIndex)
 	return true
 }
 
@@ -189,8 +210,80 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	snapshotIndex := rf.getFirstLog().Index
+	if snapshotIndex >= index {
+		DPrintf("[Node %v] rejects snapshotting with snapshotIndex %v as current snapshotIndex is %v in term %v", rf.me, index, snapshotIndex, rf.currentTerm)
+		return
+	}
+	newLogLen := len(rf.logs[index-rf.getFirstLog().Index:])
+	tmp := make([]Entry, newLogLen)
+	copy(tmp, rf.logs[index-rf.getFirstLog().Index:])
+	rf.logs = tmp
+	rf.logs[0].Command = nil
+	rf.persister.SaveStateAndSnapshot(rf.encodeState(), snapshot)
 }
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer DPrintf("[Node %v]'s state is ", rf.me)
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
+	rf.changeState(Follower)
+	rf.electionTimer.Reset(RandomElectionTimeOut())
+
+	if rf.commitIndex >= args.LastIncludedIndex {
+		return
+	}
+
+	go func() {
+		rf.applyCh <- ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      args.Data,
+			SnapshotTerm:  args.LastIncludedTerm,
+			SnapshotIndex: args.LastIncludedIndex,
+		}
+	}()
+}
+
+func (rf *Raft) genInstallSnapshotArgs() *InstallSnapshotArgs {
+	return &InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.getFirstLog().Index,
+		LastIncludedTerm:  rf.getFirstLog().Term,
+		Data:              rf.persister.ReadSnapshot(),
+	}
+}
+
+func (rf *Raft) handleInstallSnapshotReply(peer int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	if rf.state == Leader && rf.currentTerm == args.Term {
+		if reply.Term > rf.currentTerm {
+			rf.changeState(Follower)
+			rf.votedFor = -1
+			rf.currentTerm = reply.Term
+			rf.persist()
+		} else {
+			rf.matchIndex[peer] = args.LastIncludedIndex
+			rf.nextIndex[peer] = args.LastIncludedIndex + 1
+		}
+	}
+}
+
+// RPC
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
 func (rf *Raft) genRequestVoteArgs() *RequestVoteArgs {
 	lastLog := rf.getLastLog()
 	return &RequestVoteArgs{
@@ -306,8 +399,10 @@ func (rf *Raft) broadcastHeartbeat(isHeartbeat bool) {
 			continue
 		}
 		if isHeartbeat {
+			//立刻发送保证leader地位
 			go rf.doReplicate(peer)
 		} else {
+			//只需向replicatorCond goroutine 发出信号即可批量发送entry
 			rf.replicatorCond[peer].Signal()
 		}
 	}
@@ -324,6 +419,7 @@ func (rf *Raft) doReplicate(peer int) {
 	// 注意：对于一个新当选的leader，rf.nextIndex[peer]初始化为rf.getLastLog().Index + 1
 	// 此时prevLogIndex就是leader最后一条log的index
 	prevLogIndex := rf.nextIndex[peer] - 1
+	// 只用entries就够了
 	if prevLogIndex >= rf.getFirstLog().Index {
 		args := rf.genAppendEntriesArgs(prevLogIndex)
 		rf.mu.RUnlock()
@@ -334,14 +430,14 @@ func (rf *Raft) doReplicate(peer int) {
 			rf.mu.Unlock()
 		}
 	} else { // need snapshot
-		//args := rf.genInstallSnapshotArgs()
-		//rf.mu.RUnlock()
-		//reply := new(InstallSnapshotReply)
-		//if rf.sendInstallSnapshot(peer, args, reply) {
-		//	rf.mu.Lock()
-		//	rf.handleInstallSnapshotReply(peer, args, reply)
-		//	rf.mu.Unlock()
-		//}
+		args := rf.genInstallSnapshotArgs()
+		rf.mu.RUnlock()
+		reply := new(InstallSnapshotReply)
+		if rf.sendInstallSnapshot(peer, args, reply) {
+			rf.mu.Lock()
+			rf.handleInstallSnapshotReply(peer, args, reply)
+			rf.mu.Unlock()
+		}
 	}
 }
 func (rf *Raft) genAppendEntriesArgs(prevLogIndex int) *AppendEntriesArgs {

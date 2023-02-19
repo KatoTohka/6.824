@@ -70,3 +70,29 @@ type AppendEntriesReply struct {
 func (response AppendEntriesReply) String() string {
 	return fmt.Sprintf("{Term:%v,Success:%v,XTerm:%v,XIndex:%v,XLen:%v}", response.Term, response.Success, response.XTerm, response.XIndex, response.XLen)
 }
+
+type InstallSnapshotArgs struct {
+	//领导人的任期号
+	Term int
+	//领导人的 ID，以便于跟随者重定向请求
+	LeaderId int
+	//快照中包含的最后日志条目的索引值
+	LastIncludedIndex int
+	//快照中包含的最后日志条目的任期号
+	LastIncludedTerm int
+	//从偏移量开始的快照分块的原始字节
+	Data []byte
+}
+
+func (args InstallSnapshotArgs) String() string {
+	return fmt.Sprintf("{Term:%v,LeaderId:%v,LastIncludedIndex:%v,LastIncludedTerm:%v}", args.Term, args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm)
+}
+
+type InstallSnapshotReply struct {
+	//当前任期号（currentTerm），便于领导人更新自己
+	Term int
+}
+
+func (reply InstallSnapshotReply) String() string {
+	return fmt.Sprintf("{Term:%v}", reply.Term)
+}
