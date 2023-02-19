@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"sort"
 	//	"bytes"
 	"sync"
@@ -119,12 +121,14 @@ func (rf *Raft) changeState(state State) {
 		rf.electionTimer.Reset(RandomElectionTimeOut())
 	case Candidate:
 	case Leader:
+		//	log处理
 		lastLog := rf.getLastLog()
 		for i := 0; i < len(rf.peers); i++ {
-			rf.matchIndex[i], rf.nextIndex[i] = 0, lastLog.Index+1
+			rf.matchIndex[i] = 0
+			rf.nextIndex[i] = lastLog.Index + 1
 		}
-		rf.electionTimer.Stop()
 		rf.heartbeatTimer.Reset(FixedHeartBeatTimeout())
+		rf.electionTimer.Stop()
 	}
 }
 
@@ -134,12 +138,13 @@ func (rf *Raft) changeState(state State) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.logs)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -150,17 +155,23 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var logs []Entry
+	var currentTerm int
+	var votedFor int
+	if d.Decode(&logs) != nil ||
+		d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil {
+		DPrintf("cannot read persist data")
+	} else {
+		rf.logs = logs
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.lastApplied = rf.logs[0].Index
+		rf.commitIndex = rf.logs[0].Index
+	}
+
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -287,16 +298,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.electionTimer.Reset(RandomElectionTimeOut())
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
-}
-
-func (rf *Raft) reInitLeaderState() {
-	//	log处理
-	//lastLog := rf.getLastLog()
-	//for i:=0;i<len(rf.peers);i++{
-	//	rf.nex
-	//}
-	rf.heartbeatTimer.Reset(FixedHeartBeatTimeout())
-	rf.electionTimer.Stop()
 }
 
 func (rf *Raft) broadcastHeartbeat(isHeartbeat bool) {
