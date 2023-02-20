@@ -586,7 +586,7 @@ func (rf *Raft) handleAppendEntriesReply(peer int, args *AppendEntriesArgs, repl
 				find := false
 				for i := args.PrevLogIndex; i >= firstLogIndex; i-- {
 					// case 2: Leader发现自己有任期的日志，它会将自己本地记录的nextIndex设置到本地在XTerm位置的Log条目后面
-					if rf.logs[i-firstLogIndex].Term == reply.XIndex {
+					if rf.logs[i-firstLogIndex].Term == reply.XTerm {
 						find = true
 						rf.nextIndex[peer] = reply.XIndex + 1
 						break
