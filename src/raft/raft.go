@@ -383,8 +383,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 收到一个更高任期的RequestVoteArgs RPC，变为Follower, 采用这个新任期，清空votedFor, 从而重新获得投票权
 	// 注意: 如果你当前不是follower, 需要重置选举计时器; 如果是, 不要重置选举计时器!
 	// 因为它可能被其他候选者无限打断, 候选者总是在任期上占优！ ？？？
+	state := rf.state
 	if args.Term > rf.currentTerm {
 		rf.changeState(Follower)
+		if state != Follower {
+			rf.electionTimer.Reset(RandomElectionTimeOut())
+		}
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
@@ -488,7 +492,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// 更新自己状态为Follower
 	rf.changeState(Follower)
-	//????
+	//由于自己依然是follower，需要更新
 	rf.electionTimer.Reset(RandomElectionTimeOut())
 	//	 leader的PrevLogIndex比自己的第一条log的index还小？？
 	if args.PrevLogIndex < rf.getFirstLog().Index {
@@ -546,8 +550,6 @@ func (rf *Raft) handleAppendEntriesReply(peer int, args *AppendEntriesArgs, repl
 		// 不是leader了
 		if reply.Term > rf.currentTerm {
 			rf.changeState(Follower)
-			//>>>
-			//rf.electionTimer.Reset(RandomElectionTimeOut())
 			rf.currentTerm = reply.Term
 			rf.votedFor = -1
 			rf.persist()

@@ -72,7 +72,7 @@ func FixedHeartBeatTimeout() time.Duration {
 }
 
 // Debugging
-const Debug = true
+const Debug = false
 
 var loger *log.Logger
 
