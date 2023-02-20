@@ -512,7 +512,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.reInitFollowTimer()
 	//	 leader的PrevLogIndex比自己的第一条log的index还小？？
 	if args.PrevLogIndex < rf.getFirstLog().Index {
-		reply.Term = 0
+		// figure 8 error
+		reply.Term = rf.currentTerm
 		reply.Success = false
 		DPrintf("[Node %v] receives unexpected AppendEntriesRequest %v from [Node %v] because prevLogIndex %v < firstLogIndex %v", rf.me, args, args.LeaderId, args.PrevLogIndex, rf.getFirstLog().Index)
 		return
