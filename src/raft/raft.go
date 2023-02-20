@@ -110,29 +110,6 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isLeader
 }
 
-func (rf *Raft) changeState(state State) {
-	if rf.state == state {
-		return
-	}
-	DPrintf("[Node %d] changes state from %v to %v in term %d", rf.me, rf.state, state, rf.currentTerm)
-	rf.state = state
-	switch state {
-	case Follower:
-		rf.heartbeatTimer.Stop()
-		rf.electionTimer.Reset(RandomElectionTimeOut())
-	case Candidate:
-	case Leader:
-		//	log处理
-		lastLog := rf.getLastLog()
-		for i := 0; i < len(rf.peers); i++ {
-			rf.matchIndex[i] = 0
-			rf.nextIndex[i] = lastLog.Index + 1
-		}
-		rf.heartbeatTimer.Reset(FixedHeartBeatTimeout())
-		rf.electionTimer.Stop()
-	}
-}
-
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
@@ -185,6 +162,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// 过期snapshot
 	if lastIncludedIndex <= rf.commitIndex {
 		return false
 	}
@@ -224,12 +202,15 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.logs = tmp
 	rf.logs[0].Command = nil
 	rf.persister.SaveStateAndSnapshot(rf.encodeState(), snapshot)
+	DPrintf("[Node %v]'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} after replacing log with snapshotIndex %v as old snapshotIndex %v is smaller", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), index, snapshotIndex)
+
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer DPrintf("[Node %v]'s state is ", rf.me)
+	defer DPrintf("[Node %v]'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} before processing InstallSnapshotRequest %v and reply InstallSnapshotResponse %v", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), args, reply)
+
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		return
@@ -237,6 +218,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 	}
 	rf.changeState(Follower)
 	rf.electionTimer.Reset(RandomElectionTimeOut())
@@ -269,6 +251,7 @@ func (rf *Raft) handleInstallSnapshotReply(peer int, args *InstallSnapshotArgs, 
 	if rf.state == Leader && rf.currentTerm == args.Term {
 		if reply.Term > rf.currentTerm {
 			rf.changeState(Follower)
+			rf.reInitFollowTimer()
 			rf.votedFor = -1
 			rf.currentTerm = reply.Term
 			rf.persist()
@@ -283,16 +266,6 @@ func (rf *Raft) handleInstallSnapshotReply(peer int, args *InstallSnapshotArgs, 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
-}
-
-func (rf *Raft) genRequestVoteArgs() *RequestVoteArgs {
-	lastLog := rf.getLastLog()
-	return &RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateId:  rf.me,
-		LastLogIndex: lastLog.Index,
-		LastLogTerm:  lastLog.Term,
-	}
 }
 
 // 候选者希望发起election
@@ -320,34 +293,13 @@ func (rf *Raft) startElection() {
 	}
 }
 
-// 候选者处理投票者的reply
-func (rf *Raft) handleRequestVoteReply(peer int, args *RequestVoteArgs, reply *RequestVoteReply) {
-	DPrintf("[Node %v] receives RequestVoteReply %v from [Node %v] after sending RequestVoteArgs %v in term %v", rf.me, args, peer, reply, rf.currentTerm)
-	//	一旦这个节点不在是candidate或者term增加了，后续传过来的投票就过期，丢弃
-	// rf我们无法控制，只能通过加锁的方式控制在当前函数运行时不变，但是在此之前可能已经发生了变化
-	// args代表rf(先前)任期的情况，reply和args是相同的term
-	if rf.state == Candidate && rf.currentTerm == args.Term {
-		if reply.Term > rf.currentTerm {
-			DPrintf("[Node %v] finds a new leader [Node %v] with term %v and steps down in term %v", rf.me, peer, reply.Term, rf.currentTerm)
-			rf.changeState(Follower)
-			// rf改变状态，开启下一轮
-			rf.currentTerm = reply.Term
-			rf.votedFor = -1
-			rf.voteCnt = 0
-			rf.persist()
-			return
-		}
-		if reply.VoteGranted {
-			// 注意这里是由于在外面是异步的，一旦超过半数就立即作为leader
-			rf.voteCnt += 1
-			if rf.voteCnt > len(rf.peers)/2 {
-				DPrintf("[Node %v] receives majority votes in term %v", rf.me, rf.currentTerm)
-				rf.changeState(Leader)
-				rf.voteCnt = 0
-				// 当选leader后立即发送心跳信号
-				rf.broadcastHeartbeat(true)
-			}
-		}
+func (rf *Raft) genRequestVoteArgs() *RequestVoteArgs {
+	lastLog := rf.getLastLog()
+	return &RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: lastLog.Index,
+		LastLogTerm:  lastLog.Term,
 	}
 }
 
@@ -407,6 +359,70 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.electionTimer.Reset(RandomElectionTimeOut())
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
+}
+
+// 候选者处理投票者的reply
+func (rf *Raft) handleRequestVoteReply(peer int, args *RequestVoteArgs, reply *RequestVoteReply) {
+	DPrintf("[Node %v] receives RequestVoteReply %v from [Node %v] after sending RequestVoteArgs %v in term %v", rf.me, args, peer, reply, rf.currentTerm)
+	//	一旦这个节点不在是candidate或者term增加了，后续传过来的投票就过期，丢弃
+	// rf我们无法控制，只能通过加锁的方式控制在当前函数运行时不变，但是在此之前可能已经发生了变化
+	// args代表rf(先前)任期的情况，reply和args是相同的term
+	if rf.state == Candidate && rf.currentTerm == args.Term {
+		if reply.Term > rf.currentTerm {
+			DPrintf("[Node %v] finds a new leader [Node %v] with term %v and steps down in term %v", rf.me, peer, reply.Term, rf.currentTerm)
+			rf.changeState(Follower)
+			// rf改变状态，开启下一轮
+			rf.currentTerm = reply.Term
+			rf.votedFor = -1
+			rf.voteCnt = 0
+			rf.persist()
+			return
+		}
+		if reply.VoteGranted {
+			// 注意这里是由于在外面是异步的，一旦超过半数就立即作为leader
+			rf.voteCnt += 1
+			if rf.voteCnt > len(rf.peers)/2 {
+				DPrintf("[Node %v] receives majority votes in term %v", rf.me, rf.currentTerm)
+				rf.changeState(Leader)
+				rf.reInitLeaderState()
+				rf.voteCnt = 0
+				// 当选leader后立即发送心跳信号
+				rf.broadcastHeartbeat(true)
+			}
+		}
+	}
+}
+
+// example code to send a RequestVote RPC to a server.
+// server is the index of the target server in rf.peers[].
+// expects RPC arguments in args.
+// fills in *reply with RPC reply, so caller should
+// pass &reply.
+// the types of the args and reply passed to Call() must be
+// the same as the types of the arguments declared in the
+// handler function (including whether they are pointers).
+//
+// The labrpc package simulates a lossy network, in which servers
+// may be unreachable, and in which requests and replies may be lost.
+// Call() sends a request and waits for a reply. If a reply arrives
+// within a timeout interval, Call() returns true; otherwise
+// Call() returns false. Thus Call() may not return for a while.
+// A false return can be caused by a dead server, a live server that
+// can't be reached, a lost request, or a lost reply.
+//
+// Call() is guaranteed to return (perhaps after a delay) *except* if the
+// handler function on the server side does not return.  Thus there
+// is no need to implement your own timeouts around Call().
+//
+// look at the comments in ../labrpc/labrpc.go for more details.
+//
+// if you're having trouble getting RPC to work, check that you've
+// capitalized all field names in structs passed over RPC, and
+// that the caller passes the address of the reply struct with &, not
+// the struct itself.
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
 }
 
 func (rf *Raft) broadcastHeartbeat(isHeartbeat bool) {
@@ -493,7 +509,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 更新自己状态为Follower
 	rf.changeState(Follower)
 	//由于自己依然是follower，需要更新
-	rf.electionTimer.Reset(RandomElectionTimeOut())
+	rf.reInitFollowTimer()
 	//	 leader的PrevLogIndex比自己的第一条log的index还小？？
 	if args.PrevLogIndex < rf.getFirstLog().Index {
 		reply.Term = 0
@@ -550,6 +566,7 @@ func (rf *Raft) handleAppendEntriesReply(peer int, args *AppendEntriesArgs, repl
 		// 不是leader了
 		if reply.Term > rf.currentTerm {
 			rf.changeState(Follower)
+			rf.reInitFollowTimer()
 			rf.currentTerm = reply.Term
 			rf.votedFor = -1
 			rf.persist()
@@ -629,36 +646,27 @@ func (rf *Raft) getLastLog() Entry {
 	return rf.logs[len(rf.logs)-1]
 }
 
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+func (rf *Raft) changeState(state State) {
+	if rf.state == state {
+		return
+	}
+	DPrintf("[Node %d] changes state from %v to %v in term %d", rf.me, rf.state, state, rf.currentTerm)
+	rf.state = state
+}
+
+func (rf *Raft) reInitFollowTimer() {
+	rf.heartbeatTimer.Stop()
+	rf.electionTimer.Reset(RandomElectionTimeOut())
+}
+
+func (rf *Raft) reInitLeaderState() {
+	lastLog := rf.getLastLog()
+	for i := 0; i < len(rf.peers); i++ {
+		rf.matchIndex[i] = 0
+		rf.nextIndex[i] = lastLog.Index + 1
+	}
+	rf.heartbeatTimer.Reset(FixedHeartBeatTimeout())
+	rf.electionTimer.Stop()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -760,6 +768,7 @@ func (rf *Raft) ticker() {
 			if rf.state == Leader {
 				DPrintf("[Leader %d] Heartbeat elapsed, start new Heartbeat", rf.me)
 				rf.broadcastHeartbeat(true)
+				// 发送心跳后重置心跳计时器
 				rf.heartbeatTimer.Reset(FixedHeartBeatTimeout())
 			}
 			rf.mu.Unlock()
